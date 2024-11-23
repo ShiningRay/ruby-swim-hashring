@@ -1,7 +1,9 @@
 require 'rspec'
 require 'concurrent'
 require 'msgpack'
-require 'eventmachine'
+require 'async'
+require 'async/io'
+require 'async/io/protocol/line'
 
 # Add lib to load path
 $LOAD_PATH.unshift File.expand_path('../lib', __dir__)

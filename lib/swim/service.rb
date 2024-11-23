@@ -1,3 +1,5 @@
+require 'socket'
+require 'msgpack'
 require_relative 'protocol'
 require_relative 'hash_ring'
 require_relative 'request_handler'
@@ -13,16 +15,25 @@ module Swim
       @port = port
       @seeds = seeds
       @protocol = Protocol.new(host, port, seeds, self)
-      @hash_ring = HashRing.new(["#{host}:#{port}"])
+      @hash_ring = HashRing.new(["#{host}:#{@port}"])
       @handlers = {}
+      @running = false
 
-      Logger.info("Initializing service #{name} on #{host}:#{port}")
+      Logger.info("Initializing service #{name} on #{host}:#{@port}")
       setup_state_handlers
     end
 
     def start
+      return if @running
+      @running = true
       Logger.info("Starting service #{@name}")
       @protocol.start
+    end
+
+    def stop
+      return unless @running
+      @running = false
+      @protocol.stop
     end
 
     def register_handler(path, &block)
@@ -109,22 +120,22 @@ module Swim
       host, port = node.split(':')
       Logger.debug("Forwarding request to #{node}#{path}")
       begin
-        response = RequestHandler.send_request(host, port.to_i, path, payload)
-        Logger.debug("Received response from #{node}: #{response}")
-        response
+        socket = UDPSocket.new
+        request = {
+          path: path,
+          payload: payload
+        }.to_msgpack
+        
+        socket.send(request, 0, host, port.to_i)
+        
+        response = socket.recvfrom(65535)[0]
+        MessagePack.unpack(response)
       rescue => e
         Logger.error("Error forwarding request to #{node}: #{e.message}")
         { error: "Failed to forward request: #{e.message}" }
+      ensure
+        socket.close
       end
-    end
-
-    def update_ring
-      # Update hash ring with current alive members
-      nodes = @protocol.members.values
-                      .select(&:alive?)
-                      .map(&:address)
-      Logger.debug("Updating hash ring with nodes: #{nodes.join(', ')}")
-      @hash_ring = HashRing.new(nodes)
     end
   end
 end

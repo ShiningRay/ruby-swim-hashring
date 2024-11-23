@@ -1,5 +1,4 @@
-require 'digest'
-
+require 'xxhash'
 module Swim
   class HashRing
     DEFAULT_REPLICAS = 160
@@ -37,7 +36,8 @@ module Swim
 
     def hash_key(key)
       # Convert the SHA256 hex digest to an integer for consistent hashing
-      Digest::SHA256.hexdigest(key.to_s)[0..7].to_i(16)
+      # Digest::SHA256.hexdigest(key.to_s)[0..7].to_i(16)
+      XXhash.xxh32(key.to_s)
     end
   end
 end

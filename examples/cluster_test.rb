@@ -1,5 +1,8 @@
 require_relative '../lib/swim/service'
 
+# Enable debug logging
+Swim::Logger.debug!
+
 def create_service(name, port, seeds = [])
   service = Swim::Service.new(
     name,
@@ -35,3 +38,13 @@ puts "Seeds: #{seeds.join(', ')}" unless seeds.empty?
 # Create and start the service
 service = create_service(name, port, seeds)
 service.start
+
+# Keep the main thread running
+puts "Service is running. Press Ctrl+C to stop."
+begin
+  sleep
+rescue Interrupt
+  puts "\nShutting down service..."
+  service.stop
+  puts "Service stopped."
+end

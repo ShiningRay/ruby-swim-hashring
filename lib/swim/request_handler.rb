@@ -1,4 +1,6 @@
-require 'socket'
+require 'async'
+require 'async/io'
+require 'async/io/protocol/line'
 require 'msgpack'
 require 'timeout'
 require_relative 'logger'
@@ -12,71 +14,66 @@ module Swim
         Logger.debug("Sending request to #{host}:#{port}#{path}")
         Logger.debug("Request payload: #{payload}")
 
-        begin
-          Timeout.timeout(timeout) do
-            socket = TCPSocket.new(host, port)
+        Async do |task|
+          begin
+            endpoint = Async::IO::Endpoint.tcp(host, port)
+            peer = endpoint.connect
+            stream = Async::IO::Protocol::Line.new(peer)
+
             request = {
-              type: :request,
               path: path,
               payload: payload
-            }.to_msgpack
+            }
 
             Logger.debug("Writing request to socket")
-            socket.write([request.bytesize].pack('N'))  # Write message size first
-            socket.write(request)
-            
-            # Read response size
-            size_data = socket.read(4)
-            return { error: 'Invalid response' } unless size_data
-            
-            size = size_data.unpack('N')[0]
-            response_data = socket.read(size)
+            stream.write_line(request.to_msgpack)
+            stream.flush
             
             Logger.debug("Reading response from socket")
-            result = MessagePack.unpack(response_data)
+            response = stream.read_line
+            result = MessagePack.unpack(response)
             Logger.debug("Received response: #{result}")
             result
+          rescue Async::TimeoutError => e
+            Logger.error("Request timed out after #{timeout} seconds")
+            { error: 'Request timed out' }
+          rescue Errno::ECONNREFUSED => e
+            Logger.error("Connection refused to #{host}:#{port}")
+            { error: 'Connection refused' }
+          rescue => e
+            Logger.error("Error sending request: #{e.message}\n#{e.backtrace.join("\n")}")
+            { error: e.message }
           ensure
-            socket.close
+            peer&.close
           end
-        rescue Timeout::Error => e
-          Logger.error("Request timed out after #{timeout} seconds")
-          { error: 'Request timed out' }
-        rescue Errno::ECONNREFUSED => e
-          Logger.error("Connection refused to #{host}:#{port}")
-          { error: 'Connection refused' }
-        rescue => e
-          Logger.error("Error sending request: #{e.message}\n#{e.backtrace.join("\n")}")
-          { error: e.message }
         end
       end
 
-      def handle_connection(socket, service)
-        Logger.debug("Handling new connection from #{socket.peeraddr[2]}:#{socket.peeraddr[1]}")
+      def handle_connection(peer, service)
+        Logger.debug("Handling new connection")
         
-        begin
-          # Read response size
-          size_data = socket.read(4)
-          return { error: 'Invalid response' } unless size_data
-          
-          size = size_data.unpack('N')[0]
-          request_data = socket.read(size)
-          
-          Logger.debug("Received request: #{request_data}")
-          request = MessagePack.unpack(request_data)
-          path = request['path']
-          payload = request['payload']
-          
-          response = service.handle_request(path, payload)
-          Logger.debug("Sending response: #{response}")
-          
-          socket.write([response.to_msgpack.bytesize].pack('N'))  # Write message size first
-          socket.write(response.to_msgpack)
-        rescue => e
-          Logger.error("Error handling connection: #{e.message}\n#{e.backtrace.join("\n")}")
-          socket.write({ error: e.message }.to_msgpack)
-        ensure
-          socket.close
+        Async do |task|
+          begin
+            stream = Async::IO::Protocol::Line.new(peer)
+            request_data = stream.read_line
+            request = MessagePack.unpack(request_data)
+            
+            Logger.debug("Received request: #{request}")
+            path = request['path']
+            payload = request['payload']
+            
+            response = service.handle_request(path, payload)
+            Logger.debug("Sending response: #{response}")
+            
+            stream.write_line(response.to_msgpack)
+            stream.flush
+          rescue => e
+            Logger.error("Error handling connection: #{e.message}\n#{e.backtrace.join("\n")}")
+            stream.write_line({ error: e.message }.to_msgpack)
+            stream.flush
+          ensure
+            peer.close
+          end
         end
       end
     end

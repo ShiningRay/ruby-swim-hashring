@@ -3,41 +3,44 @@ require 'time'
 
 module Swim
   class Member
-    attr_reader :host, :port, :incarnation, :state, :last_state_change_at
+    attr_reader :host, :port, :incarnation, :status
+    attr_accessor :last_response
 
     def initialize(host, port, incarnation = 0)
       @host = host
       @port = port
       @incarnation = incarnation
-      @state = :alive
-      @last_state_change_at = Time.now.to_f
+      @status = :alive
+      @last_response = Time.now
+      @last_state_change = Time.now
     end
 
     def address
       "#{@host}:#{@port}"
     end
 
-    def update(new_state, new_incarnation)
-      return if new_incarnation < @incarnation
-      
-      if new_incarnation > @incarnation
-        @incarnation = new_incarnation
-        update_state(new_state)
-      else # equal incarnation
-        update_state(new_state) if more_severe?(new_state)
-      end
+    def mark_alive
+      update_status(:alive)
+    end
+
+    def mark_suspicious
+      update_status(:suspicious)
+    end
+
+    def mark_failed
+      update_status(:failed)
     end
 
     def alive?
-      @state == :alive
+      @status == :alive
     end
 
-    def suspect?
-      @state == :suspect
+    def suspicious?
+      @status == :suspicious
     end
 
-    def dead?
-      @state == :dead
+    def failed?
+      @status == :failed
     end
 
     def to_msgpack
@@ -45,20 +48,18 @@ module Swim
         'host' => @host,
         'port' => @port,
         'incarnation' => @incarnation,
-        'state' => @state.to_s
+        'status' => @status.to_s,
+        'last_response' => @last_response.to_f
       }.to_msgpack
     end
 
     private
 
-    def update_state(new_state)
-      @state = new_state
-      @last_state_change_at = Time.now.to_f
-    end
-
-    def more_severe?(new_state)
-      severity = { alive: 0, suspect: 1, dead: 2 }
-      severity.fetch(new_state, 0) > severity.fetch(@state, 0)
+    def update_status(new_status)
+      return if new_status == @status
+      @status = new_status
+      @last_state_change = Time.now
+      Logger.debug("Member #{address} status changed to #{new_status}")
     end
   end
 end

@@ -1,7 +1,6 @@
-require 'eventmachine'
-require 'msgpack'
-require 'concurrent'
 require 'socket'
+require 'concurrent'
+require 'msgpack'
 require_relative 'member'
 require_relative 'state_manager'
 require_relative 'logger'
@@ -10,150 +9,342 @@ module Swim
   class Protocol
     PROTOCOL_PERIOD = 1.0  # seconds
     PING_TIMEOUT = 0.5     # seconds
-    SUSPECT_TIMEOUT = 5.0  # seconds
-    SYNC_INTERVAL = 5.0    # seconds
+    PING_REQUEST_TIMEOUT = 0.5  # seconds
 
-    attr_reader :host, :port, :members, :incarnation, :service, :state_manager
+    attr_reader :members, :state_manager
 
-    def initialize(host, port, seeds = [], service = nil)
+    def initialize(host, port, seeds, service)
       @host = host
       @port = port
-      @members = Concurrent::Map.new
-      @incarnation = 0
-      @seeds = seeds
       @service = service
+      @seeds = seeds
       @state_manager = StateManager.new
-      
-      # Add self as a member
-      local_member = Member.new(@host, @port, @incarnation)
-      @members[local_member.address] = local_member
-      Logger.info("Initialized protocol node #{local_member.address}")
+      @members = {}
+      @running = false
+      @socket = UDPSocket.new
+      @socket.bind(@host, @port)
 
       setup_state_sync
+      initialize_members(seeds)
     end
 
     def start
-      if port_in_use?(@port)
-        Logger.error("Port #{@port} is already in use")
-        raise "Port #{@port} is already in use"
+      return if @running
+      @running = true
+      Logger.info("Starting SWIM protocol on #{@host}:#{@port}")
+      
+      @protocol_thread = Thread.new { run_protocol_loop }
+      @receive_thread = Thread.new { run_receive_loop }
+
+      # Send join message to seeds
+      join_cluster if @seeds && !@seeds.empty?
+    end
+
+    def stop
+      return unless @running
+      
+      # Broadcast leave message
+      Logger.info("Broadcasting leave message")
+      message = {
+        'type' => 'leave',
+        'source' => "#{@host}:#{@port}",
+        'timestamp' => Time.now.to_f
+      }
+      broadcast_message(message)
+      
+      # Wait a bit for the message to be sent
+      sleep(0.1)
+      
+      @running = false
+      
+      # Close socket to interrupt receive_thread
+      @socket.close rescue nil
+      
+      # Give threads a chance to exit gracefully
+      begin
+        Timeout.timeout(2) do
+          @protocol_thread&.join
+          @receive_thread&.join
+        end
+      rescue Timeout::Error
+        # Force kill threads if they don't exit in time
+        @protocol_thread&.kill
+        @receive_thread&.kill
+        Logger.warn("Had to force kill protocol threads")
       end
       
-      EM.run do
-        setup_server
-        setup_timers
-        if @seeds.any?
-          Logger.info("Joining cluster with seeds: #{@seeds.join(', ')}")
-          join_cluster
-        else
-          Logger.info("Starting new cluster on #{@host}:#{@port}")
-        end
-      end
+      Logger.info("Protocol stopped")
     end
 
     private
 
-    def port_in_use?(port)
+    def run_protocol_loop
+      while @running
+        begin
+          ping_random_member
+          sleep(PROTOCOL_PERIOD)
+        rescue => e
+          break unless @running
+          Logger.error("Error in protocol loop: #{e.message}\n#{e.backtrace.join("\n")}")
+        end
+      end
+    rescue => e
+      Logger.error("Protocol loop terminated: #{e.message}\n#{e.backtrace.join("\n")}")
+    end
+
+    def run_receive_loop
+      while @running
+        begin
+          # Use timeout to allow checking @running periodically
+          ready = IO.select([@socket], nil, nil, 1)
+          next unless ready
+          
+          data, addr = @socket.recvfrom(65535)
+          next unless @running # Check again after potentially long receive
+          
+          source_host = addr[3]
+          source_port = addr[1]
+          message = MessagePack.unpack(data)
+          handle_message(message)
+        rescue IOError, Errno::EBADF
+          break unless @running
+        rescue => e
+          break unless @running
+          Logger.error("Error in receive loop: #{e.message}\n#{e.backtrace.join("\n")}")
+        end
+      end
+    rescue => e
+      Logger.error("Receive loop terminated: #{e.message}\n#{e.backtrace.join("\n")}")
+    end
+
+    def send_message(host, port, message)
       begin
-        server = TCPServer.new(@host, port)
-        server.close
-        false
-      rescue Errno::EADDRINUSE
-        true
+        data = message.to_msgpack
+        @socket.send(data, 0, host, port)
+      rescue => e
+        Logger.error("Failed to send message to #{host}:#{port}: #{e.message}")
       end
     end
 
-    def setup_server
-      EM.start_server(@host, @port, Connection) do |conn|
-        conn.protocol = self
+    def broadcast_message(message)
+      @members.each_value do |member|
+        next if member.address == "#{@host}:#{@port}"
+        host, port = member.address.split(':')
+        send_message(host, port.to_i, message)
       end
     end
 
-    def setup_timers
-      EM.add_periodic_timer(PROTOCOL_PERIOD) { protocol_round }
-      EM.add_periodic_timer(SUSPECT_TIMEOUT) { check_suspects }
-      EM.add_periodic_timer(SYNC_INTERVAL) { sync_state }
-    end
-
-    def protocol_round
-      return if @members.size <= 1
+    def ping_random_member
+      return if @members.empty?
       
-      member = select_random_member
+      member = @members.values.reject { |m| m.address == "#{@host}:#{@port}" }.sample
       return unless member
 
-      Logger.debug("Protocol round: pinging #{member.address}")
-      ping_member(member)
-    end
-
-    def ping_member(member)
+      host, port = member.address.split(':')
       message = {
-        type: :ping,
-        source: "#{@host}:#{@port}",
-        incarnation: @incarnation
-      }.to_msgpack
+        'type' => 'ping',
+        'source' => "#{@host}:#{@port}",
+        'timestamp' => Time.now.to_f
+      }
 
-      EM.connect(member.host, member.port, Connection) do |conn|
-        conn.protocol = self
-        conn.send_data(message)
+      send_message(host, port.to_i, message)
+      
+      # Wait for response with timeout
+      start_time = Time.now
+      while Time.now - start_time < PING_TIMEOUT
+        sleep(0.1)
+        return if member.last_response && member.last_response > start_time
       end
 
-      EM.add_timer(PING_TIMEOUT) do
-        handle_ping_timeout(member) unless member.dead?
-      end
+      # If no response, mark as suspicious and try indirect ping
+      member.mark_suspicious
+      indirect_ping(member)
     end
 
-    def handle_ping_timeout(member)
-      Logger.warn("Member #{member.address} timed out, marking as suspect")
-      member.suspect!
-      disseminate_updates([member])
-    end
+    def indirect_ping(target_member)
+      k = 3 # number of indirect ping members
+      indirect_members = @members.values
+                                .reject { |m| m.address == target_member.address || m.address == "#{@host}:#{@port}" }
+                                .sample(k)
 
-    def check_suspects
-      now = Time.now.to_f
-      @members.values.each do |member|
-        if member.suspect? && (now - member.last_state_change_at) > SUSPECT_TIMEOUT
-          Logger.warn("Member #{member.address} timed out, marking as dead")
-          member.update(:dead, member.incarnation + 1)
-        end
-      end
-    end
+      return if indirect_members.empty?
 
-    def select_random_member
-      alive_members = @members.values.reject { |m| m.dead? || m.address == "#{@host}:#{@port}" }
-      alive_members.sample
-    end
-
-    def disseminate_updates(updates)
       message = {
-        type: :update,
-        source: "#{@host}:#{@port}",
-        updates: updates.map { |m| [m.address, m.status, m.incarnation] }
-      }.to_msgpack
+        'type' => 'ping_req',
+        'source' => "#{@host}:#{@port}",
+        'target' => target_member.address,
+        'timestamp' => Time.now.to_f
+      }
 
-      @members.values.each do |member|
-        next if member.dead? || member.address == "#{@host}:#{@port}"
-        
+      indirect_members.each do |member|
         host, port = member.address.split(':')
-        Logger.debug("Sending message to #{member.address}")
-        EM.connect(host, port.to_i, Connection) do |conn|
-          conn.protocol = self
-          conn.send_data(message)
-        end
+        send_message(host, port.to_i, message)
+      end
+
+      # Wait for indirect ping response
+      start_time = Time.now
+      while Time.now - start_time < PING_REQUEST_TIMEOUT
+        sleep(0.1)
+        return if target_member.last_response && target_member.last_response > start_time
+      end
+
+      target_member.mark_failed
+      remove_member(target_member)
+    end
+
+    def handle_message(message)
+      Logger.debug("Received message: #{message}")
+      
+      case message['type'].to_s
+      when 'ping'
+        handle_ping(message)
+      when 'ack'
+        handle_ack(message)
+      when 'ping_req'
+        handle_ping_req(message)
+      when 'join'
+        handle_join(message)
+      when 'leave'
+        handle_leave(message)
+      when 'update'
+        handle_update(message)
+      when 'members'
+        handle_members(message)
+      when 'member_joined'
+        handle_member_joined(message)
+      when 'state_sync'
+        handle_state_sync(message)
+      when 'state_update'
+        handle_state_update(message)
+      else
+        Logger.warn("Unknown message type: #{message['type']}")
       end
     end
 
-    def join_cluster
-      @seeds.each do |seed|
-        host, port = seed.split(':')
-        message = {
-          type: :join,
-          source: "#{@host}:#{@port}",
-          incarnation: @incarnation
-        }.to_msgpack
+    def handle_join(message)
+      source = message['source']
+      return if source == "#{@host}:#{@port}"
 
-        EM.connect(host, port.to_i, Connection) do |conn|
-          conn.protocol = self
-          conn.send_data(message)
-        end
+      # Add the new member
+      unless @members[source]
+        host, port = source.split(':')
+        member = Member.new(host, port.to_i)
+        @members[source] = member
+        Logger.info("New member joined: #{source}")
+        Logger.debug { "Current member list: #{@members.keys.join(', ')}" }
+
+        # Send current member list to the new member
+        response = {
+          'type' => 'members',
+          'source' => "#{@host}:#{@port}",
+          'members' => @members.keys,
+          'timestamp' => Time.now.to_f
+        }
+        host, port = source.split(':')
+        send_message(host, port.to_i, response)
+
+        # Broadcast new member to all existing members
+        broadcast = {
+          'type' => 'member_joined',
+          'source' => "#{@host}:#{@port}",
+          'member' => source,
+          'timestamp' => Time.now.to_f
+        }
+        broadcast_message(broadcast)
+      end
+    end
+
+    def handle_members(message)
+      return if message['source'] == "#{@host}:#{@port}"
+      
+      Logger.info("Received member list from #{message['source']}")
+      message['members'].each do |member_addr|
+        next if member_addr == "#{@host}:#{@port}" || @members[member_addr]
+        
+        host, port = member_addr.split(':')
+        member = Member.new(host, port.to_i)
+        @members[member_addr] = member
+        Logger.debug { "Added member: #{member_addr}" }
+      end
+      Logger.debug { "Updated member list: #{@members.keys.join(', ')}" }
+    end
+
+    def handle_member_joined(message)
+      return if message['source'] == "#{@host}:#{@port}"
+      
+      member_addr = message['member']
+      unless @members[member_addr]
+        host, port = member_addr.split(':')
+        member = Member.new(host, port.to_i)
+        @members[member_addr] = member
+        Logger.info("Member joined (broadcast): #{member_addr}")
+        Logger.debug { "Current member list: #{@members.keys.join(', ')}" }
+      end
+    end
+
+    def handle_ping(message)
+      response = {
+        'type' => 'ack',
+        'source' => "#{@host}:#{@port}",
+        'in_response_to' => message['timestamp']
+      }
+      
+      source_host, source_port = message['source'].split(':')
+      send_message(source_host, source_port.to_i, response)
+    end
+
+    def handle_ack(message)
+      source = message['source']
+      member = @members[source]
+      return unless member
+
+      member.mark_alive
+      member.last_response = Time.now
+    end
+
+    def handle_ping_req(message)
+      target_host, target_port = message['target'].split(':')
+      ping_message = {
+        'type' => 'ping',
+        'source' => "#{@host}:#{@port}",
+        'timestamp' => Time.now.to_f
+      }
+
+      send_message(target_host, target_port.to_i, ping_message)
+    end
+
+    def handle_leave(message)
+      source = message['source']
+      return if source == "#{@host}:#{@port}"
+
+      if @members[source]
+        Logger.info("Member left: #{source}")
+        @members.delete(source)
+        Logger.debug { "Current member list: #{@members.keys.join(', ')}" }
+      end
+    end
+
+    def handle_update(message)
+      source = message['source']
+      member = @members[source]
+      return unless member
+
+      member.status = message['status']
+      Logger.info("Member #{source} status updated to #{message['status']}")
+    end
+
+    def handle_state_sync(message)
+      if message['state'] && message['source'] != "#{@host}:#{@port}"
+        @state_manager.merge(message['state'])
+        Logger.info("State synchronized with #{message['source']}")
+      else
+        Logger.warn("Failed to apply state snapshot from #{message['source']}")
+      end
+    end
+
+    def handle_state_update(message)
+      message['updates'].each do |key, value, operation|
+        @state_manager.merge_update([[key, value, operation]])
       end
     end
 
@@ -167,126 +358,44 @@ module Swim
     def broadcast_state_update(key, value, operation)
       Logger.debug("Broadcasting state update: #{key} = #{value} (#{operation})")
       message = {
-        type: :state_update,
-        source: "#{@host}:#{@port}",
-        updates: [[key, value, operation]]
-      }.to_msgpack
-
-      broadcast_to_members(message)
+        'type' => 'state_update',
+        'source' => "#{@host}:#{@port}",
+        'updates' => [[key, value, operation]]
+      }
+      broadcast_message(message)
     end
 
-    def broadcast_to_members(message)
-      @members.values.each do |member|
-        next if member.dead? || member.address == "#{@host}:#{@port}"
-        
-        host, port = member.address.split(':')
-        Logger.debug("Sending message to #{member.address}")
-        EM.connect(host, port.to_i, Connection) do |conn|
-          conn.protocol = self
-          conn.send_data(message)
-        end
+    def initialize_members(seeds)
+      seeds.each do |seed|
+        next if seed == "#{@host}:#{@port}"
+        host, port = seed.split(':')
+        @members[seed] = Member.new(host, port.to_i)
       end
     end
 
-    def sync_state
-      Logger.debug("Initiating state sync")
-      snapshot = @state_manager.snapshot
+    def remove_member(member)
+      @members.delete(member.address)
+      Logger.info("Removed failed member: #{member.address}")
+      broadcast_message({
+        'type' => 'update',
+        'source' => member.address,
+        'status' => :failed
+      })
+    end
+
+    def join_cluster
+      Logger.info("Joining cluster with seeds: #{@seeds.join(', ')}")
       message = {
-        type: :state_sync,
-        source: "#{@host}:#{@port}",
-        snapshot: snapshot
-      }.to_msgpack
+        'type' => 'join',
+        'source' => "#{@host}:#{@port}",
+        'timestamp' => Time.now.to_f
+      }
 
-      broadcast_to_members(message)
-    end
-  end
-
-  class Connection < EM::Connection
-    attr_accessor :protocol
-
-    def receive_data(data)
-      message = MessagePack.unpack(data)
-      handle_message(message)
-    end
-
-    private
-
-    def handle_message(message)
-      case message['type'].to_s
-      when 'ping'
-        handle_ping(message)
-      when 'update'
-        handle_update(message)
-      when 'join'
-        handle_join(message)
-      when 'request'
-        handle_request(message)
-      when 'state_update'
-        handle_state_update(message)
-      when 'state_sync'
-        handle_state_sync(message)
+      @seeds.each do |seed|
+        next if seed == "#{@host}:#{@port}"
+        host, port = seed.split(':')
+        send_message(host, port.to_i, message)
       end
-    end
-
-    def handle_ping(message)
-      response = {
-        type: :ack,
-        source: message['source'],
-        incarnation: protocol.incarnation
-      }.to_msgpack
-      
-      send_data(response)
-    end
-
-    def handle_update(message)
-      message['updates'].each do |address, status, incarnation|
-        member = protocol.members[address]
-        if member
-          case status.to_s
-          when Member::ALIVE.to_s
-            member.alive!(incarnation)
-          when Member::SUSPECT.to_s
-            member.suspect!
-          when Member::DEAD.to_s
-            member.dead!
-          end
-        end
-      end
-    end
-
-    def handle_join(message)
-      host, port = message['source'].split(':')
-      new_member = Member.new(host, port.to_i, message['incarnation'])
-      protocol.members[new_member.address] = new_member
-      
-      # Send current membership list
-      updates = protocol.members.values.map { |m| [m.address, m.status, m.incarnation] }
-      response = {
-        type: :update,
-        source: "#{protocol.host}:#{protocol.port}",
-        updates: updates
-      }.to_msgpack
-      
-      send_data(response)
-    end
-
-    def handle_request(message)
-      response = protocol.service.handle_request(
-        message['path'],
-        message['payload']
-      )
-      
-      send_data(response.to_msgpack)
-    end
-
-    def handle_state_update(message)
-      message['updates'].each do |key, value, operation|
-        protocol.state_manager.apply(key, value, operation)
-      end
-    end
-
-    def handle_state_sync(message)
-      protocol.state_manager.sync(message['snapshot'])
     end
   end
 end

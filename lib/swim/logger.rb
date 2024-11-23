@@ -35,8 +35,8 @@ module Swim
     end
 
     class << self
-      def debug(msg)
-        instance.logger.debug(msg)
+      def debug(msg=nil, &block)
+        instance.logger.debug(msg, &block)
       end
 
       def info(msg)
