@@ -15,11 +15,12 @@ module Swim
       @port = port
       @seeds = seeds
       @protocol = Protocol.new(host, port, seeds, self)
-      @hash_ring = HashRing.new(["#{host}:#{@port}"])
       @handlers = {}
       @running = false
+      @http_server = nil
+      @http_port = port + 1000  # HTTP 端口比 UDP 端口大 1000
 
-      Logger.info("Initializing service #{name} on #{host}:#{@port}")
+      Logger.info("Initializing service #{name} on #{host}:#{@port} (HTTP: #{@http_port})")
       setup_state_handlers
     end
 
@@ -28,12 +29,14 @@ module Swim
       @running = true
       Logger.info("Starting service #{@name}")
       @protocol.start
+      start_http_server
     end
 
     def stop
       return unless @running
       @running = false
       @protocol.stop
+      stop_http_server
     end
 
     def register_handler(path, &block)
@@ -60,7 +63,7 @@ module Swim
     end
 
     def route_request(service_name, path, payload)
-      target_node = @hash_ring.get_node(service_name)
+      target_node = @protocol.hash_ring.get_node(service_name)
       unless target_node
         Logger.error("No available node found for service: #{service_name}")
         return { error: 'Service Unavailable' }
@@ -135,6 +138,49 @@ module Swim
         { error: "Failed to forward request: #{e.message}" }
       ensure
         socket.close
+      end
+    end
+
+    def start_http_server
+      require 'webrick'
+      @http_server = WEBrick::HTTPServer.new(
+        Port: @http_port,
+        Logger: WEBrick::Log.new("/dev/null"),
+        AccessLog: []
+      )
+
+      @http_server.mount_proc '/' do |req, res|
+        begin
+          path = req.path
+          payload = req.body ? JSON.parse(req.body) : {}
+          
+          Logger.debug("HTTP Request: #{req.request_method} #{path}")
+          Logger.debug("Payload: #{payload}")
+          
+          result = handle_request(path, payload)
+          
+          res.status = result[:error] ? 400 : 200
+          res.content_type = 'application/json'
+          res.body = result.to_json
+        rescue => e
+          Logger.error("HTTP Error: #{e.message}\n#{e.backtrace.join("\n")}")
+          res.status = 500
+          res.content_type = 'application/json'
+          res.body = { error: e.message }.to_json
+        end
+      end
+
+      Thread.new do
+        Logger.info("Starting HTTP server on port #{@http_port}")
+        @http_server.start
+      end
+    end
+
+    def stop_http_server
+      if @http_server
+        Logger.info("Stopping HTTP server")
+        @http_server.shutdown
+        @http_server = nil
       end
     end
   end

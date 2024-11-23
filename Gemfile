@@ -7,6 +7,8 @@ gem 'colorize', '~> 1.1'
 gem 'logger', '~> 1.6'
 gem 'ostruct', '~> 0.6'
 gem 'xxhash'
+gem 'webrick'
+gem 'json'
 
 group :development, :test do
   gem 'rspec', '~> 3.12.0'

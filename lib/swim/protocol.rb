@@ -4,6 +4,7 @@ require 'msgpack'
 require_relative 'member'
 require_relative 'state_manager'
 require_relative 'logger'
+require_relative 'hash_ring'
 
 module Swim
   class Protocol
@@ -11,18 +12,24 @@ module Swim
     PING_TIMEOUT = 0.5     # seconds
     PING_REQUEST_TIMEOUT = 0.5  # seconds
 
-    attr_reader :members, :state_manager
+    attr_reader :members, :state_manager, :hash_ring
 
-    def initialize(host, port, seeds, service)
+    def initialize(host, port, seeds = [], service = nil)
       @host = host
       @port = port
-      @service = service
       @seeds = seeds
-      @state_manager = StateManager.new
+      @service = service
       @members = {}
+      @hash_ring = HashRing.new
+      @state_manager = StateManager.new
       @running = false
       @socket = UDPSocket.new
-      @socket.bind(@host, @port)
+      @socket.bind(host, port)
+      
+      # Add self to members and hash ring
+      self_addr = "#{host}:#{port}"
+      @members[self_addr] = Member.new(host, port)
+      @hash_ring.add_node(self_addr)
 
       setup_state_sync
       initialize_members(seeds)
@@ -230,8 +237,10 @@ module Swim
         host, port = source.split(':')
         member = Member.new(host, port.to_i)
         @members[source] = member
+        @hash_ring.add_node(source)
         Logger.info("New member joined: #{source}")
         Logger.debug { "Current member list: #{@members.keys.join(', ')}" }
+        Logger.debug { "Updated hash ring: #{@hash_ring.nodes.join(', ')}" }
 
         # Send current member list to the new member
         response = {
@@ -264,9 +273,11 @@ module Swim
         host, port = member_addr.split(':')
         member = Member.new(host, port.to_i)
         @members[member_addr] = member
+        @hash_ring.add_node(member_addr)
         Logger.debug { "Added member: #{member_addr}" }
       end
       Logger.debug { "Updated member list: #{@members.keys.join(', ')}" }
+      Logger.debug { "Updated hash ring: #{@hash_ring.nodes.join(', ')}" }
     end
 
     def handle_member_joined(message)
@@ -277,8 +288,10 @@ module Swim
         host, port = member_addr.split(':')
         member = Member.new(host, port.to_i)
         @members[member_addr] = member
+        @hash_ring.add_node(member_addr)
         Logger.info("Member joined (broadcast): #{member_addr}")
         Logger.debug { "Current member list: #{@members.keys.join(', ')}" }
+        Logger.debug { "Updated hash ring: #{@hash_ring.nodes.join(', ')}" }
       end
     end
 
@@ -320,7 +333,9 @@ module Swim
       if @members[source]
         Logger.info("Member left: #{source}")
         @members.delete(source)
+        @hash_ring.remove_node(source)
         Logger.debug { "Current member list: #{@members.keys.join(', ')}" }
+        Logger.debug { "Updated hash ring: #{@hash_ring.nodes.join(', ')}" }
       end
     end
 
@@ -370,11 +385,13 @@ module Swim
         next if seed == "#{@host}:#{@port}"
         host, port = seed.split(':')
         @members[seed] = Member.new(host, port.to_i)
+        @hash_ring.add_node(seed)
       end
     end
 
     def remove_member(member)
       @members.delete(member.address)
+      @hash_ring.remove_node(member.address)
       Logger.info("Removed failed member: #{member.address}")
       broadcast_message({
         'type' => 'update',
