@@ -1,8 +1,8 @@
 require 'socket'
 require 'msgpack'
+require 'json'
 require_relative 'protocol'
 require_relative 'hash_ring'
-require_relative 'request_handler'
 require_relative 'logger'
 
 module Swim
@@ -161,12 +161,12 @@ module Swim
           
           res.status = result[:error] ? 400 : 200
           res.content_type = 'application/json'
-          res.body = result.to_json
+          res.body = JSON.generate(result)
         rescue => e
           Logger.error("HTTP Error: #{e.message}\n#{e.backtrace.join("\n")}")
           res.status = 500
           res.content_type = 'application/json'
-          res.body = { error: e.message }.to_json
+          res.body = JSON.generate({ error: e.message })
         end
       end
 
