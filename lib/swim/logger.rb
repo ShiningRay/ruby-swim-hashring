@@ -15,15 +15,20 @@ module Swim
     }
 
     attr_reader :logger
+    attr_accessor :node_id
 
     def initialize
       @logger = ::Logger.new(STDOUT)
       @logger.level = ::Logger::INFO
+      @node_id = nil
       
       @logger.formatter = proc do |severity, datetime, progname, msg|
         color = SEVERITY_COLORS[severity] || :default
         time = datetime.strftime("%Y-%m-%d %H:%M:%S.%L")
         prefix = "[#{severity}] #{time}"
+        
+        # Add node ID if available
+        prefix += " [#{@node_id}]" if @node_id
         
         # Add process and thread information in debug mode
         if @logger.level == ::Logger::DEBUG
@@ -35,6 +40,10 @@ module Swim
     end
 
     class << self
+      def set_node_id(id)
+        instance.node_id = id
+      end
+
       def debug(msg=nil, &block)
         instance.logger.debug(msg, &block)
       end
@@ -59,12 +68,8 @@ module Swim
         instance.logger.level = level
       end
 
-      def debug!
-        instance.logger.level = ::Logger::DEBUG
-      end
-
-      def info!
-        instance.logger.level = ::Logger::INFO
+      def level
+        instance.logger.level
       end
     end
   end
