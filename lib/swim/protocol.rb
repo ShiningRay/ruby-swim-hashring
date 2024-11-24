@@ -10,6 +10,7 @@ module Swim
     PROTOCOL_PERIOD = 1.0  # seconds
     PING_TIMEOUT = 0.5     # seconds
     PING_REQUEST_TIMEOUT = 0.5  # seconds
+    SYNC_INTERVAL = 10.0  # seconds
 
     attr_reader :members, :state_manager, :host, :port
 
@@ -17,31 +18,41 @@ module Swim
       @host = host
       @port = port
       @seeds = Array(seeds)
-      @members = {}
-      @state_manager = StateManager.new(initial_metadata)
+      @members = Concurrent::Map.new
+      @state_manager = StateManager.new
       @running = false
+      @callbacks = Concurrent::Array.new
+      @metadata_callbacks = Concurrent::Array.new
+      
+      # 初始化 socket
       @socket = UDPSocket.new
       @socket.bind(host, port)
       
-      # Add self to members
-      self_addr = "#{host}:#{port}"
-      @members[self_addr] = Member.new(host, port)
-
-      # Set logger node ID
-      Logger.set_node_id(self_addr)
-
-      setup_state_sync
+      # 初始化元数据
+      initial_metadata.each do |namespace, data|
+        data.each do |key, value|
+          set_metadata(key, value, namespace)
+        end
+      end
+      
       initialize_members(seeds)
+      setup_state_sync
     end
 
     def start
       return if @running
       @running = true
-      Logger.info("Starting SWIM protocol on #{@host}:#{@port}")
       
-      @protocol_thread = Thread.new { run_protocol_loop }
-      @receive_thread = Thread.new { run_receive_loop }
-
+      # 启动协议循环
+      @protocol_thread = Thread.new do
+        run_protocol_loop
+      end
+      
+      # 启动接收循环
+      @receive_thread = Thread.new do
+        run_receive_loop
+      end
+      
       # Send join message to seeds
       join_cluster if @seeds && !@seeds.empty?
     end
@@ -49,31 +60,45 @@ module Swim
     def stop
       return unless @running
       @running = false
-      @socket.close
-      @protocol_thread&.exit
-      @receive_thread&.exit
+      
+      # 关闭 socket
+      @socket.close rescue nil
+      
+      # 等待线程结束
+      [@protocol_thread, @receive_thread, @sync_thread].each do |thread|
+        thread&.join(1) # 等待最多1秒
+        thread&.kill if thread&.alive?
+      end
+      
+      @protocol_thread = nil
+      @receive_thread = nil
+      @sync_thread = nil
       Logger.info("Stopped SWIM protocol on #{@host}:#{@port}")
     end
 
     def get_metadata(key, namespace = 'default')
+      return nil if key.nil? || namespace.nil?
       @state_manager.get(key, namespace)
     end
 
     def set_metadata(key, value, namespace = 'default')
+      return false if key.nil? || namespace.nil?
       @state_manager.set(key, value, namespace)
+      true
     end
 
     def delete_metadata(key, namespace = 'default')
+      return false if key.nil? || namespace.nil?
       @state_manager.delete(key, namespace)
+      true
     end
 
     def on_metadata_change(&block)
-      @state_manager.subscribe(&block)
+      @metadata_callbacks << block
     end
 
     def on_member_change(&block)
-      @member_change_callbacks ||= []
-      @member_change_callbacks << block
+      @callbacks << block
     end
 
     def alive_members
@@ -88,300 +113,159 @@ module Swim
       @members.select { |_, m| m.dead? }.keys
     end
 
+    def metadata
+      @state_manager.get_namespace('default')
+    end
+
+    def merge_metadata(metadata)
+      return unless metadata.is_a?(Hash)
+      
+      metadata.each do |namespace, data|
+        next unless namespace.is_a?(String) && data.is_a?(Hash)
+        data.each do |key, value|
+          next if key.nil?
+          set_metadata(key, value, namespace)
+        end
+      end
+    end
+
     private
 
     def notify_member_change(member_addr, old_status, new_status)
-      return unless @member_change_callbacks
-      @member_change_callbacks.each do |callback|
+      return unless @callbacks
+      @callbacks.each do |callback|
         callback.call(member_addr, old_status, new_status)
       end
+    end
+
+    def run_receive_loop
+      buffer = []
+      while @running
+        begin
+          ready = IO.select([@socket], nil, nil, 1)
+          next unless ready
+          
+          data, addr = @socket.recvfrom(65535)
+          message = MessagePack.unpack(data)
+          handle_message(message)
+        rescue IOError, Errno::EBADF => e
+          break if !@running  # 正常退出
+          Logger.error("Socket closed unexpectedly: #{e.message}")
+          break
+        rescue => e
+          Logger.error("Error in receive loop: #{e.message}")
+          Logger.debug(e.backtrace.join("\n"))
+        end
+      end
+    rescue => e
+      Logger.error("Fatal error in receive loop: #{e.message}")
+      Logger.debug(e.backtrace.join("\n"))
     end
 
     def run_protocol_loop
       while @running
         begin
+          check_members
           ping_random_member
-          sleep(PROTOCOL_PERIOD)
+          sleep(1)
         rescue => e
-          break unless @running
-          Logger.error("Error in protocol loop: #{e.message}\n#{e.backtrace.join("\n")}")
+          Logger.error("Error in protocol loop: #{e.message}")
+          Logger.debug(e.backtrace.join("\n"))
         end
       end
     rescue => e
-      Logger.error("Protocol loop terminated: #{e.message}\n#{e.backtrace.join("\n")}")
+      Logger.error("Fatal error in protocol loop: #{e.message}")
+      Logger.debug(e.backtrace.join("\n"))
     end
 
-    def run_receive_loop
-      while @running
-        begin
-          # Use timeout to allow checking @running periodically
-          ready = IO.select([@socket], nil, nil, 1)
-          next unless ready
-          
-          data, addr = @socket.recvfrom(65535)
-          next unless @running # Check again after potentially long receive
-          
-          source_host = addr[3]
-          source_port = addr[1]
-          message = MessagePack.unpack(data)
-          handle_message(message)
-        rescue IOError, Errno::EBADF
-          break unless @running
-        rescue => e
-          break unless @running
-          Logger.error("Error in receive loop: #{e.message}\n#{e.backtrace.join("\n")}")
+    def check_members
+      @members.each_pair do |addr, member|
+        next if addr == "#{@host}:#{@port}"  # 跳过自己
+        
+        if member.check_timeouts
+          # 如果返回 true，表示成员应该被移除
+          @members.delete(addr)
+          Logger.info("Removed failed member: #{addr}")
         end
       end
-    rescue => e
-      Logger.error("Receive loop terminated: #{e.message}\n#{e.backtrace.join("\n")}")
     end
 
     def send_message(host, port, message)
       begin
-        data = message.to_msgpack
-        @socket.send(data, 0, host, port)
+        socket = TCPSocket.new(host, port)
+        socket.write(MessagePack.pack(message))
+        socket.close
+      rescue Errno::ECONNREFUSED
+        Logger.debug("Connection refused by #{host}:#{port}")
+        handle_member_unreachable("#{host}:#{port}")
       rescue => e
-        Logger.error("Failed to send message to #{host}:#{port}: #{e.message}")
+        Logger.error("Error sending message to #{host}:#{port}: #{e.message}")
+        Logger.debug(e.backtrace.join("\n"))
+        handle_member_unreachable("#{host}:#{port}")
+      ensure
+        socket&.close
+      end
+    end
+
+    def handle_member_unreachable(addr)
+      return unless addr && @members[addr]
+      
+      member = @members[addr]
+      old_status = member.status
+      
+      case member.status
+      when :alive
+        member.status = :suspect
+        notify_member_change(addr, old_status, :suspect)
+      when :suspect
+        member.status = :dead
+        notify_member_change(addr, old_status, :dead)
       end
     end
 
     def broadcast_message(message)
-      @members.each_value do |member|
-        next if member.address == "#{@host}:#{@port}"
-        host, port = member.address.split(':')
+      @members.each_pair do |addr, member|
+        next if member.dead?
+        host, port = addr.split(':')
         send_message(host, port.to_i, message)
-      end
-    end
-
-    def ping_random_member
-      return if @members.empty?
-      
-      member = @members.values.reject { |m| m.address == "#{@host}:#{@port}" }.sample
-      return unless member
-
-      host, port = member.address.split(':')
-      message = {
-        'type' => 'ping',
-        'source' => "#{@host}:#{@port}",
-        'timestamp' => Time.now.to_f
-      }
-
-      send_message(host, port.to_i, message)
-      
-      # Wait for response with timeout
-      start_time = Time.now
-      while Time.now - start_time < PING_TIMEOUT
-        sleep(0.1)
-        return if member.last_response && member.last_response > start_time
-      end
-
-      # If no response, mark as suspicious and try indirect ping
-      member.mark_suspicious
-      indirect_ping(member)
-    end
-
-    def indirect_ping(target_member)
-      k = 3 # number of indirect ping members
-      indirect_members = @members.values
-                                .reject { |m| m.address == target_member.address || m.address == "#{@host}:#{@port}" }
-                                .sample(k)
-
-      return if indirect_members.empty?
-
-      message = {
-        'type' => 'ping_req',
-        'source' => "#{@host}:#{@port}",
-        'target' => target_member.address,
-        'timestamp' => Time.now.to_f
-      }
-
-      indirect_members.each do |member|
-        host, port = member.address.split(':')
-        send_message(host, port.to_i, message)
-      end
-
-      # Wait for indirect ping response
-      start_time = Time.now
-      while Time.now - start_time < PING_REQUEST_TIMEOUT
-        sleep(0.1)
-        return if target_member.last_response && target_member.last_response > start_time
-      end
-
-      target_member.mark_failed
-      remove_member(target_member)
-    end
-
-    def handle_message(message)
-      Logger.debug("Received message: #{message}")
-      
-      case message['type'].to_s
-      when 'ping'
-        handle_ping(message)
-      when 'ack'
-        handle_ack(message)
-      when 'ping_req'
-        handle_ping_req(message)
-      when 'join'
-        handle_join(message)
-      when 'leave'
-        handle_leave(message)
-      when 'update'
-        handle_update(message)
-      when 'members'
-        handle_members(message)
-      when 'member_joined'
-        handle_member_joined(message)
-      when 'state_sync'
-        handle_state_sync(message)
-      when 'state_update'
-        handle_state_update(message)
-      else
-        Logger.warn("Unknown message type: #{message['type']}")
-      end
-    end
-
-    def handle_join(message)
-      source = message['source']
-      return if source == "#{@host}:#{@port}"
-
-      # Add the new member
-      unless @members[source]
-        host, port = source.split(':')
-        member = Member.new(host, port.to_i)
-        @members[source] = member
-        Logger.info("New member joined: #{source}")
-        Logger.debug { "Current member list: #{@members.keys.join(', ')}" }
-
-        # Send current member list to the new member
-        response = {
-          'type' => 'members',
-          'source' => "#{@host}:#{@port}",
-          'members' => @members.keys,
-          'timestamp' => Time.now.to_f
-        }
-        host, port = source.split(':')
-        send_message(host, port.to_i, response)
-
-        # Broadcast new member to all existing members
-        broadcast = {
-          'type' => 'member_joined',
-          'source' => "#{@host}:#{@port}",
-          'member' => source,
-          'timestamp' => Time.now.to_f
-        }
-        broadcast_message(broadcast)
-      end
-    end
-
-    def handle_members(message)
-      return if message['source'] == "#{@host}:#{@port}"
-      
-      Logger.info("Received member list from #{message['source']}")
-      message['members'].each do |member_addr|
-        next if member_addr == "#{@host}:#{@port}" || @members[member_addr]
-        
-        host, port = member_addr.split(':')
-        member = Member.new(host, port.to_i)
-        @members[member_addr] = member
-        Logger.debug { "Added member: #{member_addr}" }
-      end
-      Logger.debug { "Updated member list: #{@members.keys.join(', ')}" }
-    end
-
-    def handle_member_joined(message)
-      return if message['source'] == "#{@host}:#{@port}"
-      
-      member_addr = message['member']
-      unless @members[member_addr]
-        host, port = member_addr.split(':')
-        member = Member.new(host, port.to_i)
-        @members[member_addr] = member
-        Logger.info("Member joined (broadcast): #{member_addr}")
-        Logger.debug { "Current member list: #{@members.keys.join(', ')}" }
-      end
-    end
-
-    def handle_ping(message)
-      response = {
-        'type' => 'ack',
-        'source' => "#{@host}:#{@port}",
-        'in_response_to' => message['timestamp']
-      }
-      
-      source_host, source_port = message['source'].split(':')
-      send_message(source_host, source_port.to_i, response)
-    end
-
-    def handle_ack(message)
-      source = message['source']
-      member = @members[source]
-      return unless member
-
-      member.mark_alive
-      member.last_response = Time.now
-    end
-
-    def handle_ping_req(message)
-      target_host, target_port = message['target'].split(':')
-      ping_message = {
-        'type' => 'ping',
-        'source' => "#{@host}:#{@port}",
-        'timestamp' => Time.now.to_f
-      }
-
-      send_message(target_host, target_port.to_i, ping_message)
-    end
-
-    def handle_leave(message)
-      source = message['source']
-      return if source == "#{@host}:#{@port}"
-
-      if @members[source]
-        Logger.info("Member left: #{source}")
-        @members.delete(source)
-        Logger.debug { "Current member list: #{@members.keys.join(', ')}" }
-      end
-    end
-
-    def handle_update(message)
-      source = message['source']
-      member = @members[source]
-      return unless member
-
-      member.status = message['status']
-      Logger.info("Member #{source} status updated to #{message['status']}")
-    end
-
-    def handle_state_sync(message)
-      if message['state'] && message['source'] != "#{@host}:#{@port}"
-        @state_manager.merge(message['state'])
-        Logger.info("State synchronized with #{message['source']}")
-      else
-        Logger.warn("Failed to apply state snapshot from #{message['source']}")
-      end
-    end
-
-    def handle_state_update(message)
-      message['updates'].each do |key, value, operation|
-        @state_manager.merge_update([[key, value, operation]])
       end
     end
 
     def setup_state_sync
-      Logger.debug("Setting up state synchronization")
-      @state_manager.subscribe do |key, value, operation|
-        broadcast_state_update(key, value, operation)
+      @sync_thread = Thread.new do
+        loop do
+          begin
+            sleep(SYNC_INTERVAL)
+            next if @members.empty?
+            
+            # 随机选择一个活跃的成员进行状态同步
+            alive_addrs = @members.each_pair.select { |_, m| m.alive? }.map(&:first)
+            next if alive_addrs.empty?
+            
+            target_addr = alive_addrs.sample
+            host, port = target_addr.split(':')
+            
+            send_message(host, port.to_i, {
+              'type' => 'state_sync',
+              'source' => "#{@host}:#{@port}",
+              'state' => @state_manager.snapshot
+            })
+          rescue => e
+            Logger.error("Error in state sync: #{e.message}")
+            Logger.debug(e.backtrace.join("\n"))
+          end
+        end
       end
     end
 
     def broadcast_state_update(key, value, operation)
-      Logger.debug("Broadcasting state update: #{key} = #{value} (#{operation})")
-      message = {
+      return if @members.empty?
+      
+      broadcast_message({
         'type' => 'state_update',
         'source' => "#{@host}:#{@port}",
         'updates' => [[key, value, operation]]
-      }
-      broadcast_message(message)
+      })
     end
 
     def initialize_members(seeds)
@@ -414,6 +298,232 @@ module Swim
         next if seed == "#{@host}:#{@port}"
         host, port = seed.split(':')
         send_message(host, port.to_i, message)
+      end
+    end
+
+    def ping_random_member
+      return if @members.empty?
+      
+      # 随机选择一个活跃的成员
+      alive_members = @members.values.select(&:alive?)
+      return if alive_members.empty?
+
+      member = alive_members.sample
+      return if member.address == "#{@host}:#{@port}"  # 不要 ping 自己
+
+      message = {
+        'type' => 'ping',
+        'source' => "#{@host}:#{@port}",
+        'timestamp' => Time.now.to_f
+      }
+
+      if send_message(member.host, member.port, message)
+        member.pending_ping = Time.now
+      end
+    end
+
+    def handle_ping(message)
+      response = {
+        'type' => 'ack',
+        'source' => "#{@host}:#{@port}",
+        'in_response_to' => message['timestamp']
+      }
+      
+      source_host, source_port = message['source'].split(':')
+      send_message(source_host, source_port.to_i, response)
+    end
+
+    def handle_ack(message)
+      source = message['source']
+      member = @members[source]
+      return unless member
+
+      member.mark_alive
+      member.last_response = Time.now
+      member.pending_ping = nil
+    end
+
+    def indirect_ping(target_member)
+      # 选择 3 个其他成员发送间接 ping
+      other_members = @members.values.reject { |m| 
+        m.address == target_member.address || 
+        m.address == "#{@host}:#{@port}" || 
+        !m.alive?
+      }
+
+      k = [3, other_members.size].min
+      return if k == 0
+
+      ping_req_message = {
+        'type' => 'ping_req',
+        'source' => "#{@host}:#{@port}",
+        'target' => target_member.address,
+        'timestamp' => Time.now.to_f
+      }
+
+      other_members.sample(k).each do |member|
+        send_message(member.host, member.port, ping_req_message)
+      end
+    end
+
+    def handle_message(message)
+      return unless message.is_a?(Hash) && message['type']
+      Logger.debug("Received message: #{message}")
+      
+      case message['type']
+      when 'join'
+        handle_join(message)
+      when 'members'
+        handle_members(message)
+      when 'member_joined'
+        handle_member_joined(message)
+      when 'ping'
+        handle_ping(message)
+      when 'ack'
+        handle_ack(message)
+      when 'ping_req'
+        handle_ping_req(message)
+      when 'leave'
+        handle_leave(message)
+      when 'update'
+        handle_update(message)
+      when 'state_sync'
+        handle_state_sync(message)
+      when 'state_update'
+        handle_state_update(message)
+      else
+        Logger.warn("Unknown message type: #{message['type']}")
+      end
+    end
+
+    def handle_join(message)
+      return unless message && message['source']
+      source = message['source']
+      return if source == "#{@host}:#{@port}"
+
+      host, port = source.split(':')
+      return unless host && port
+
+      member = Member.new(host, port.to_i)
+      @members[source] = member
+      Logger.info("Member joined: #{source}")
+      Logger.debug { "Current member list: #{@members.keys.join(', ')}" }
+
+      # 广播新成员加入的消息
+      broadcast_message({
+        'type' => 'member_joined',
+        'source' => "#{@host}:#{@port}",
+        'member' => source
+      })
+
+      # 发送当前成员列表给新加入的节点
+      send_message(host, port.to_i, {
+        'type' => 'members',
+        'source' => "#{@host}:#{@port}",
+        'members' => @members.keys
+      })
+    end
+
+    def handle_members(message)
+      return unless message && message['members'].is_a?(Array)
+      
+      message['members'].each do |member_addr|
+        next unless member_addr.is_a?(String)
+        next if member_addr == "#{@host}:#{@port}"
+        next if @members[member_addr]
+
+        begin
+          host, port = member_addr.split(':')
+          next unless host && port && port.to_i.positive?
+
+          member = Member.new(host, port.to_i)
+          @members[member_addr] = member
+          Logger.debug("Added member from list: #{member_addr}")
+        rescue => e
+          Logger.error("Error adding member #{member_addr}: #{e.message}")
+          Logger.debug(e.backtrace.join("\n"))
+        end
+      end
+      
+      Logger.debug { "Current member list: #{@members.keys.join(', ')}" }
+    end
+
+    def handle_member_joined(message)
+      return unless message && message['source'] && message['member']
+      return if message['source'] == "#{@host}:#{@port}"
+      
+      member_addr = message['member']
+      return if @members[member_addr]
+      return if member_addr == "#{@host}:#{@port}"
+
+      begin
+        host, port = member_addr.split(':')
+        return unless host && port && port.to_i.positive?
+
+        member = Member.new(host, port.to_i)
+        @members[member_addr] = member
+        Logger.info("Member joined (broadcast): #{member_addr}")
+        Logger.debug { "Current member list: #{@members.keys.join(', ')}" }
+      rescue => e
+        Logger.error("Error handling member joined #{member_addr}: #{e.message}")
+        Logger.debug(e.backtrace.join("\n"))
+      end
+    end
+
+    def handle_ping_req(message)
+      return unless message && message['target']
+      
+      begin
+        target_host, target_port = message['target'].split(':')
+        return unless target_host && target_port && target_port.to_i.positive?
+
+        ping_message = {
+          'type' => 'ping',
+          'source' => "#{@host}:#{@port}",
+          'timestamp' => Time.now.to_f
+        }
+
+        send_message(target_host, target_port.to_i, ping_message)
+      rescue => e
+        Logger.error("Error handling ping request: #{e.message}")
+        Logger.debug(e.backtrace.join("\n"))
+      end
+    end
+
+    def handle_leave(message)
+      return unless message && message['source']
+      source = message['source']
+      return if source == "#{@host}:#{@port}"
+
+      if member = @members[source]
+        old_status = member.status
+        member.status = :dead
+        notify_member_change(source, old_status, :dead)
+        Logger.info("Member left: #{source}")
+      end
+    end
+
+    def handle_update(message)
+      source = message['source']
+      member = @members[source]
+      return unless member
+
+      member.status = message['status']
+      Logger.info("Member #{source} status updated to #{message['status']}")
+    end
+
+    def handle_state_sync(message)
+      if message['state'] && message['source'] != "#{@host}:#{@port}"
+        @state_manager.merge(message['state'])
+        Logger.info("State synchronized with #{message['source']}")
+      else
+        Logger.warn("Failed to apply state snapshot from #{message['source']}")
+      end
+    end
+
+    def handle_state_update(message)
+      message['updates'].each do |key, value, operation|
+        @state_manager.merge_update([[key, value, operation]])
       end
     end
   end

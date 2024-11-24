@@ -9,11 +9,10 @@ module Swim
     attr_reader :version, :data
 
     def initialize(initial_metadata = {})
-      @data = Concurrent::Map.new
-      @version_vectors = Concurrent::Map.new
+      @state = Concurrent::Map.new
+      @subscribers = Concurrent::Array.new
       @version = 0
       @mutex = Mutex.new
-      @subscribers = []
       @node_id = SecureRandom.uuid
       
       # Initialize with provided metadata
@@ -27,45 +26,35 @@ module Swim
     end
 
     def set(key, value, namespace = 'default')
-      @mutex.synchronize do
-        namespaced_key = "#{namespace}:#{key}"
-        old_value = @data[namespaced_key]
-        return if old_value == value
+      return false if key.nil? || namespace.nil?
 
-        @data[namespaced_key] = value
-        update_version_vector(namespaced_key)
-        notify_subscribers(namespaced_key, value, :set)
+      @mutex.synchronize do
+        ns = @state[namespace] ||= Concurrent::Map.new
+        old_value = ns[key]
+        ns[key] = value
+        @version += 1
+        notify_subscribers("#{namespace}:#{key}", value, old_value.nil? ? :add : :update)
+        true
       end
     end
 
     def get(key, namespace = 'default')
-      @data["#{namespace}:#{key}"]
+      return nil if key.nil? || namespace.nil?
+      
+      ns = @state[namespace]
+      ns&.[](key)
     end
 
     def delete(key, namespace = 'default')
-      @mutex.synchronize do
-        namespaced_key = "#{namespace}:#{key}"
-        old_value = @data.delete(namespaced_key)
-        if old_value
-          update_version_vector(namespaced_key)
-          notify_subscribers(namespaced_key, nil, :delete)
-        end
-      end
-    end
+      return false if key.nil? || namespace.nil?
 
-    def merge_update(updates)
       @mutex.synchronize do
-        updates.each do |key, value, operation, remote_vector|
-          next if should_skip_update?(key, remote_vector)
-          
-          case operation.to_sym
-          when :set
-            @data[key] = value
-            @version_vectors[key] = remote_vector
-          when :delete
-            @data.delete(key)
-            @version_vectors[key] = remote_vector
-          end
+        ns = @state[namespace]
+        if ns && ns.key?(key)
+          value = ns.delete(key)
+          @version += 1
+          notify_subscribers("#{namespace}:#{key}", nil, :delete)
+          value
         end
       end
     end
@@ -77,49 +66,106 @@ module Swim
     def snapshot
       @mutex.synchronize do
         {
-          version: @version,
-          data: @data.each_pair.to_h,
-          version_vectors: @version_vectors.each_pair.to_h,
-          checksum: calculate_checksum
+          'state' => @state.each_pair.each_with_object({}) { |(ns, data), hash|
+            hash[ns] = data.each_pair.each_with_object({}) { |(k, v), h| h[k] = v }
+          },
+          'version' => @version
         }
       end
     end
 
-    def apply_snapshot(snapshot)
+    def merge(snapshot)
+      return if !snapshot || !snapshot['state']
+      
       @mutex.synchronize do
-        if valid_snapshot?(snapshot)
-          @data.clear
-          snapshot[:data].each { |k, v| @data[k] = v }
-          @version_vectors = Concurrent::Map.new(snapshot[:version_vectors])
-          @version = snapshot[:version]
-          true
-        else
-          false
+        # 只有当接收到的版本号更新时才合并
+        if snapshot['version'].to_i > @version
+          snapshot['state'].each do |namespace, data|
+            next if namespace.nil? || !data.is_a?(Hash)
+            
+            ns = @state[namespace] ||= Concurrent::Map.new
+            data.each do |key, value|
+              next if key.nil?
+              
+              old_value = ns[key]
+              if old_value != value
+                ns[key] = value
+                notify_subscribers("#{namespace}:#{key}", value, old_value.nil? ? :add : :update)
+              end
+            end
+          end
+          @version = snapshot['version'].to_i
         end
       end
+    end
+
+    def merge_update(updates)
+      return unless updates.is_a?(Array)
+
+      @mutex.synchronize do
+        updates.each do |key, value, operation|
+          next if key.nil?
+          
+          case operation.to_sym
+          when :add, :update
+            namespace, k = key.split(':', 2)
+            next if k.nil?
+            
+            ns = @state[namespace] ||= Concurrent::Map.new
+            old_value = ns[k]
+            ns[k] = value
+            notify_subscribers(key, value, operation.to_sym)
+          when :delete
+            namespace, k = key.split(':', 2)
+            next if k.nil?
+            
+            ns = @state[namespace]
+            if ns && ns.key?(k)
+              ns.delete(k)
+              notify_subscribers(key, nil, :delete)
+            end
+          end
+        end
+        @version += 1
+      end
+    end
+
+    def get_namespace(namespace)
+      return {} if namespace.nil?
+      
+      ns = @state[namespace]
+      return {} unless ns
+      
+      ns.each_pair.each_with_object({}) { |(k, v), hash| hash[k] = v }
     end
 
     private
 
     def notify_subscribers(key, value, operation)
       @subscribers.each do |subscriber|
-        subscriber.call(key, value, operation)
+        begin
+          subscriber.call(key, value, operation)
+        rescue => e
+          Logger.error("Error in state subscriber: #{e.message}")
+        end
       end
     end
 
-    def update_version_vector(key)
-      vector = @version_vectors[key] || {}
-      vector[@node_id] = (vector[@node_id] || 0) + 1
-      @version_vectors[key] = vector
-      @version += 1
+    def calculate_checksum
+      data_string = @state.each_pair.each_with_object({}) { |(ns, data), hash|
+        hash[ns] = data.each_pair.each_with_object({}) { |(k, v), h| h[k] = v }
+      }.to_s
+      Digest::SHA256.hexdigest(data_string)
     end
 
-    def should_skip_update?(key, remote_vector)
-      return false unless @version_vectors[key]
-      
-      local_vector = @version_vectors[key]
-      # Compare version vectors to detect concurrent updates
-      remote_vector.all? { |node, count| (local_vector[node] || 0) >= count }
+    def sync_with_peers
+      snapshot = {
+        'state' => @state.each_pair.each_with_object({}) { |(ns, data), hash|
+          hash[ns] = data.each_pair.each_with_object({}) { |(k, v), h| h[k] = v }
+        },
+        'version' => @version
+      }
+      notify_subscribers(:sync, snapshot, :sync)
     end
 
     def start_sync_timer
@@ -135,32 +181,20 @@ module Swim
       end
     end
 
-    def sync_with_peers
-      snapshot = {
-        version: @version,
-        data: @data.each_pair.to_h,
-        version_vectors: @version_vectors.each_pair.to_h,
-        checksum: calculate_checksum
-      }
-      notify_subscribers(:sync, snapshot, :sync)
-    end
-
-    def calculate_checksum
-      data_string = @data.each_pair.sort.to_s
-      Digest::SHA256.hexdigest(data_string)
-    end
-
     def valid_snapshot?(snapshot)
-      return false unless snapshot[:version] && snapshot[:data] && snapshot[:checksum] && snapshot[:version_vectors]
+      return false unless snapshot['version'] && snapshot['state'] && snapshot['checksum']
       
-      @data.clear
-      snapshot[:data].each { |k, v| @data[k] = v }
-      @version_vectors = Concurrent::Map.new(snapshot[:version_vectors])
+      @state.clear
+      snapshot['state'].each do |namespace, data|
+        ns = @state[namespace] ||= Concurrent::Map.new
+        data.each do |key, value|
+          ns[key] = value
+        end
+      end
       checksum = calculate_checksum
-      @data.clear
-      @version_vectors.clear
+      @state.clear
       
-      checksum == snapshot[:checksum]
+      checksum == snapshot['checksum']
     end
   end
 end
