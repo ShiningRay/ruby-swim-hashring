@@ -26,7 +26,7 @@ module Swim
     protocol = Protocol.new(host, port, seeds, initial_metadata)
     
     if enable_http
-      http_server = HttpServer.new(protocol, http_port)
+      http_server = HTTPServer.new(protocol, http_port)
       protocol.instance_variable_set(:@http_server, http_server)
       
       original_start = protocol.method(:start)

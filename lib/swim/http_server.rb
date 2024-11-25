@@ -2,7 +2,7 @@ require 'webrick'
 require 'json'
 
 module Swim
-  class HttpServer
+  class HTTPServer
     def initialize(protocol, port = nil)
       @protocol = protocol
       @port = port || (@protocol.port + 1000)

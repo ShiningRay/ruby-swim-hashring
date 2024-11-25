@@ -2,102 +2,167 @@ require 'msgpack'
 require 'time'
 
 module Swim
+    # Represents a member of the SWIM cluster.
+    #
+    # This class encapsulates the state and behavior of a member in a SWIM
+    # cluster, including handling of status transitions, timeout checks, and
+    # serialization. It manages the member's address, status, incarnation
+    # number, and timestamps for last response and state changes.
+    #
+    # Constants:
+    # - PING_TIMEOUT: Duration in seconds before a member is marked as suspicious.
+    # - SUSPICIOUS_TIMEOUT: Duration in seconds before a suspicious member is marked as failed.
+    # - FAILED_TIMEOUT: Duration in seconds for handling failed state.
+    #
+    # Attributes:
+    # - host: The host address of the member.
+    # - port: The port number of the member.
+    # - incarnation: The incarnation number, used for causal ordering of state changes.
+    # - last_state_change_at: Timestamp of the last state change.
+    # - last_response: The timestamp of the last response received.
+    #
+    # The member can also be asked to check for timeouts. If the member has not
+    # received a response from another member in a while, it will mark itself as
+    # suspect. If the member is already suspect and has not received a response
+    # in a longer while, it will mark itself as dead.
+    #
+    # The member can be serialized to a hash or to msgpack. The serialized form
+    # includes the member's host, port, state, incarnation number, last response
+    # time, and last state change time.
+    #
+    # The member can also be cloned. The clone will have the same state as the
+    # original, but will not share any instance variables with the original.
   class Member
     PING_TIMEOUT = 5  # seconds
     SUSPICIOUS_TIMEOUT = 10  # seconds
     FAILED_TIMEOUT = 30  # seconds
 
-    attr_reader :host, :port, :status, :incarnation
-    attr_accessor :last_response, :pending_ping
+    attr_reader :host, :port, :incarnation, :last_state_change_at
+    attr_accessor :last_response
 
-    def initialize(host, port)
+    def initialize(host, port, incarnation = 0)
       @host = host
       @port = port.to_i
-      @status = 'alive'
-      @incarnation = 0
-      @last_response = nil
-      @pending_ping = nil
-      @status_changed_at = Time.now
+      @state = :alive
+      @incarnation = incarnation
+      @last_response = Time.now
+      @last_state_change_at = Time.now.to_f
     end
 
     def address
       "#{@host}:#{@port}"
     end
 
+    def state
+      @state
+    end
+    alias_method :status, :state
+
+    def status=(new_status)
+      new_status = new_status.to_sym if new_status.is_a?(String)
+      raise ArgumentError, "Invalid status: #{new_status}" unless [:alive, :suspect, :dead].include?(new_status)
+      @state = new_status
+      @last_state_change_at = Time.now.to_f
+    end
+
     def alive?
-      @status == 'alive'
+      @state == :alive
     end
 
     def suspicious?
-      @status == 'suspicious'
+      @state == :suspect
     end
     alias_method :suspect?, :suspicious?
 
     def failed?
-      @status == 'failed'
+      @state == :dead
     end
     alias_method :dead?, :failed?
 
     def mark_alive
-      return if @status == 'alive'
-      @status = 'alive'
-      @status_changed_at = Time.now
+      return if @state == :alive
+      @state = :alive
+      @last_state_change_at = Time.now.to_f
       @incarnation += 1
-      @pending_ping = nil
     end
 
     def mark_suspicious
-      return if @status == 'suspicious'
-      @status = 'suspicious'
-      @status_changed_at = Time.now
+      return if @state == :suspect
+      @state = :suspect
+      @last_state_change_at = Time.now.to_f
     end
 
     def mark_failed
-      return if @status == 'failed'
-      @status = 'failed'
-      @status_changed_at = Time.now
-      @pending_ping = nil
+      return if @state == :dead
+      @state = :dead
+      @last_state_change_at = Time.now.to_f
     end
 
-    def status=(new_status)
-      return if @status == new_status
-      @status = new_status
-      @status_changed_at = Time.now
-      @incarnation += 1 if new_status == 'alive'
-      @pending_ping = nil if new_status != 'alive'
+    def update(new_state, new_incarnation)
+      return if new_incarnation < @incarnation
+      
+      if new_incarnation > @incarnation
+        @state = new_state
+        @incarnation = new_incarnation
+        @last_state_change_at = Time.now.to_f
+        return
+      end
+      
+      # Same incarnation, only update to more severe state
+      state_severity = { alive: 0, suspect: 1, dead: 2 }
+      current_severity = state_severity[@state]
+      new_severity = state_severity[new_state]
+      
+      if new_severity && new_severity > current_severity
+        @state = new_state
+        @last_state_change_at = Time.now.to_f
+      end
     end
+
 
     def check_timeouts
-      now = Time.now
-
-      # 检查 ping 超时
-      if @pending_ping && now - @pending_ping > PING_TIMEOUT
-        mark_suspicious
-        @pending_ping = nil
-      end
-
-      # 检查可疑状态超时
-      if suspicious? && now - @status_changed_at > SUSPICIOUS_TIMEOUT
-        mark_failed
-      end
-
-      # 检查失败状态超时
-      if failed? && now - @status_changed_at > FAILED_TIMEOUT
-        true  # 返回 true 表示应该从成员列表中移除
-      else
+      now = Time.now.to_f
+      
+      case @state
+      when :alive
+        if @last_response && (now - @last_response.to_f) > PING_TIMEOUT
+          mark_suspicious
+          true
+        else
+          false
+        end
+      when :suspect
+        if (now - @last_state_change_at) > SUSPICIOUS_TIMEOUT
+          mark_failed
+          true
+        else
+          false
+        end
+      when :dead
         false
       end
+    end
+
+    def clone
+      member = super
+      member.instance_variable_set(:@last_response, @last_response)
+      member.instance_variable_set(:@last_state_change_at, @last_state_change_at)
+      member
     end
 
     def to_h
       {
         host: @host,
         port: @port,
-        status: @status,
+        status: @state,
         incarnation: @incarnation,
-        last_response: @last_response&.to_i,
-        pending_ping: @pending_ping&.to_i
+        last_response: @last_response&.iso8601,
+        last_state_change_at: @last_state_change_at
       }
+    end
+
+    def to_msgpack
+      to_h.to_msgpack
     end
   end
 end

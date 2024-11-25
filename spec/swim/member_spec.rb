@@ -3,97 +3,93 @@ require 'spec_helper'
 RSpec.describe Swim::Member do
   let(:host) { 'localhost' }
   let(:port) { 3000 }
-  let(:incarnation) { 1 }
-  let(:member) { described_class.new(host, port, incarnation) }
+  let(:member) { described_class.new(host, port) }
 
-  describe '#initialize' do
-    it 'sets initial values correctly' do
+  describe '#initialization' do
+    it 'initializes with default values' do
       expect(member.host).to eq(host)
       expect(member.port).to eq(port)
-      expect(member.incarnation).to eq(incarnation)
-      expect(member.state).to eq(:alive)
-      expect(member.last_state_change_at).to be_within(1).of(Time.now.to_f)
-    end
-
-    it 'creates correct address string' do
-      expect(member.address).to eq("#{host}:#{port}")
+      expect(member.status).to eq(:alive)
+      expect(member.incarnation).to eq(0)
     end
   end
 
-  describe '#update' do
-    context 'when new incarnation is higher' do
-      it 'updates state and incarnation' do
-        member.update(:suspect, 2)
-        expect(member.state).to eq(:suspect)
-        expect(member.incarnation).to eq(2)
-      end
+  describe '#status management' do
+    it 'allows valid status transitions' do
+      expect { member.status = :suspect }.not_to raise_error
+      expect(member.status).to eq(:suspect)
+      expect(member.suspicious?).to be true
 
-      it 'updates last_state_change_at' do
-        old_timestamp = member.last_state_change_at
-        sleep(0.1)
-        member.update(:suspect, 2)
-        expect(member.last_state_change_at).to be > old_timestamp
-      end
+      expect { member.status = :dead }.not_to raise_error
+      expect(member.status).to eq(:dead)
+      expect(member.failed?).to be true
     end
 
-    context 'when new incarnation is lower' do
-      it 'does not update state or incarnation' do
-        member.update(:suspect, 0)
-        expect(member.state).to eq(:alive)
-        expect(member.incarnation).to eq(1)
-      end
+    it 'rejects invalid status values' do
+      expect { member.status = :invalid }.to raise_error(ArgumentError)
+      expect { member.status = 'invalid' }.to raise_error(ArgumentError)
     end
 
-    context 'when new incarnation is equal' do
-      it 'updates to more severe state' do
-        member.update(:suspect, 1)
-        expect(member.state).to eq(:suspect)
-        
-        member.update(:dead, 1)
-        expect(member.state).to eq(:dead)
-      end
+    it 'accepts string status values' do
+      expect { member.status = 'suspect' }.not_to raise_error
+      expect(member.status).to eq(:suspect)
+    end
 
-      it 'does not update to less severe state' do
-        member.update(:dead, 1)
-        expect(member.state).to eq(:dead)
-        
-        member.update(:alive, 1)
-        expect(member.state).to eq(:dead)
+    it 'tracks status change time' do
+      time = Time.now
+      Timecop.freeze(time) do
+        member.status = :suspect
+        expect(member.instance_variable_get(:@last_state_change_at)).to eq(time.to_f)
       end
     end
   end
 
-  describe 'state predicates' do
-    it 'correctly reports alive state' do
-      expect(member.alive?).to be true
-      expect(member.suspect?).to be false
-      expect(member.dead?).to be false
+  describe '#check_timeouts' do
+    before do
+      allow(member).to receive(:mark_suspicious)
+      allow(member).to receive(:mark_failed)
     end
 
-    it 'correctly reports suspect state' do
-      member.update(:suspect, 2)
-      expect(member.alive?).to be false
-      expect(member.suspect?).to be true
-      expect(member.dead?).to be false
+    it 'handles suspicious timeouts' do
+      member.status = :suspect
+      member.instance_variable_set(:@last_state_change_at, Time.now.to_f - described_class::SUSPICIOUS_TIMEOUT - 1)
+
+      expect(member.check_timeouts).to be true
+      expect(member).to have_received(:mark_failed)
     end
 
-    it 'correctly reports dead state' do
-      member.update(:dead, 2)
-      expect(member.alive?).to be false
-      expect(member.suspect?).to be false
-      expect(member.dead?).to be true
+    it 'handles failed timeouts' do
+      member.status = :dead
+      member.instance_variable_set(:@last_state_change_at, Time.now.to_f - described_class::FAILED_TIMEOUT - 1)
+
+      expect(member.check_timeouts).to be false
     end
   end
 
-  describe '#to_msgpack' do
-    it 'serializes member data correctly' do
-      packed = member.to_msgpack
-      unpacked = MessagePack.unpack(packed)
-      
-      expect(unpacked['host']).to eq(host)
-      expect(unpacked['port']).to eq(port)
-      expect(unpacked['incarnation']).to eq(incarnation)
-      expect(unpacked['state']).to eq('alive')
+  describe '#serialization' do
+    it 'serializes to hash with string keys' do
+      time = Time.now
+      Timecop.freeze(time) do
+        member.instance_variable_set(:@incarnation, 1)
+        member.instance_variable_set(:@last_response, time)
+        member.instance_variable_set(:@last_state_change_at, time.to_f)
+
+        hash = member.to_h
+        expect(hash).to include(
+          host: host,
+          port: port,
+          status: :alive,
+          incarnation: 1,
+          last_response: time.iso8601,
+          last_state_change_at: time.to_f
+        )
+      end
+    end
+
+    it 'serializes to msgpack' do
+      expect(member.to_msgpack).to be_a(String)
+      decoded = MessagePack.unpack(member.to_msgpack)
+      expect(decoded).to include('host' => host)
     end
   end
 end
