@@ -1,7 +1,9 @@
+require 'bundler/setup'
 require 'rspec'
-require 'webrick'
-require 'json'
 require 'timecop'
+require 'msgpack'
+require 'json'
+require 'webrick'
 require 'concurrent'
 require 'rspec/wait'
 
@@ -9,7 +11,6 @@ require 'rspec/wait'
 $LOAD_PATH.unshift File.expand_path('../lib', __dir__)
 require 'swim'
 
-# Configure RSpec
 RSpec.configure do |config|
   # Include wait matchers
   config.include RSpec::Wait
@@ -28,7 +29,8 @@ RSpec.configure do |config|
   config.filter_run_when_matching :focus
   config.example_status_persistence_file_path = "spec/examples.txt"
   config.disable_monkey_patching!
-  config.warnings = false
+  config.warnings = true
+
   config.order = :random
   Kernel.srand config.seed
 

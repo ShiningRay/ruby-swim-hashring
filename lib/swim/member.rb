@@ -20,6 +20,7 @@ module Swim
     # - incarnation: The incarnation number, used for causal ordering of state changes.
     # - last_state_change_at: Timestamp of the last state change.
     # - last_response: The timestamp of the last response received.
+    # - pending_ping: Timestamp of the last ping sent.
     #
     # The member can also be asked to check for timeouts. If the member has not
     # received a response from another member in a while, it will mark itself as
@@ -37,8 +38,7 @@ module Swim
     SUSPICIOUS_TIMEOUT = 10  # seconds
     FAILED_TIMEOUT = 30  # seconds
 
-    attr_reader :host, :port, :incarnation, :last_state_change_at
-    attr_accessor :last_response
+    attr_accessor :host, :port, :incarnation, :last_state_change_at, :last_response, :pending_ping
 
     def initialize(host, port, incarnation = 0)
       @host = host
@@ -47,6 +47,7 @@ module Swim
       @incarnation = incarnation
       @last_response = Time.now
       @last_state_change_at = Time.now.to_f
+      @pending_ping = nil
     end
 
     def address
@@ -56,7 +57,10 @@ module Swim
     def state
       @state
     end
-    alias_method :status, :state
+
+    def status
+      @state
+    end
 
     def status=(new_status)
       new_status = new_status.to_sym if new_status.is_a?(String)
@@ -143,10 +147,23 @@ module Swim
       end
     end
 
+    def pending_ping?
+      !@pending_ping.nil?
+    end
+
+    def clear_pending_ping
+      @pending_ping = nil
+    end
+
+    def set_pending_ping
+      @pending_ping = Time.now
+    end
+
     def clone
       member = super
       member.instance_variable_set(:@last_response, @last_response)
       member.instance_variable_set(:@last_state_change_at, @last_state_change_at)
+      member.instance_variable_set(:@pending_ping, @pending_ping)
       member
     end
 
@@ -157,7 +174,8 @@ module Swim
         status: @state,
         incarnation: @incarnation,
         last_response: @last_response&.iso8601,
-        last_state_change_at: @last_state_change_at
+        last_state_change_at: @last_state_change_at,
+        pending_ping: @pending_ping&.iso8601
       }
     end
 

@@ -45,33 +45,24 @@ module Swim
           alive_members: @protocol.alive_members.size,
           suspect_members: @protocol.suspect_members.size,
           dead_members: @protocol.dead_members.size,
-          total_members: @protocol.members.size
+          total_members: @protocol.members.size,
+          uptime: Time.now.to_i - @start_time
         }
         json_response(res, status)
       end
 
       # GET /members - List all members and their status
       @server.mount_proc '/members' do |_, res|
-        members = @protocol.members.each_pair.map do |addr, member|
-          next unless member
-
-          metadata = {}
-          @protocol.metadata.each_pair do |key, value|
-            next if key.nil?
-            namespace, k = key.split(':', 2)
-            next if k.nil?
-
-            if namespace == 'default' && k.start_with?("#{member.host}:#{member.port}:")
-              meta_key = k.sub("#{member.host}:#{member.port}:", '')
-              next if meta_key.empty?
-              metadata[meta_key] = value
-            end
-          end
-
-          member.to_h.merge(metadata: metadata)
-        end.compact
-
-        json_response(res, { members: members })
+        members = @protocol.members.map do |member|
+          {
+            address: member.address,
+            status: member.status,
+            last_response: member.last_response&.iso8601,
+            last_state_change: member.last_state_change_at,
+            incarnation: member.incarnation
+          }
+        end
+        json_response(res, members)
       end
 
       # GET /metadata - Get node metadata

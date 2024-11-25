@@ -62,18 +62,19 @@ class ClusterExample
     puts
 
     # Start the first node (seed node)
-    first_node = create_node(0, [])
+    seed_addr = "localhost:#{@base_port}"
+    first_node = create_node(0, [seed_addr])  # 种子节点也需要自己作为种子
     first_node.start
-    puts "Started seed node at localhost:#{@base_port}"
+    puts "Started seed node at #{seed_addr}"
     sleep(1)
 
     # Start other nodes
     (@node_count - 1).times do |i|
       node_index = i + 1
-      seeds = ["localhost:#{@base_port}"] # Use first node as seed
-      node = create_node(node_index, seeds)
+      node_addr = "localhost:#{@base_port + node_index}"
+      node = create_node(node_index, [seed_addr])
       node.start
-      puts "Started node #{node_index + 1} at localhost:#{@base_port + node_index}"
+      puts "Started node #{node_index + 1} at #{node_addr}"
       sleep(0.5) # Small delay between node starts
     end
 
