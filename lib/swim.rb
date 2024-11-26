@@ -10,6 +10,7 @@ require_relative 'swim/member'
 require_relative 'swim/state_manager'
 require_relative 'swim/protocol'
 require_relative 'swim/http_server'
+require_relative 'swim/directory'
 
 module Swim
   class Error < StandardError; end
