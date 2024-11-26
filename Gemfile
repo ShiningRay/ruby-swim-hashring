@@ -15,4 +15,5 @@ group :development, :test do
   gem 'rake', '~> 13.0.6'
   gem 'timecop', '~> 0.9.6'
   gem 'rspec-wait', '~> 0.0.9'
+  gem 'pry'
 end

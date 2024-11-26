@@ -6,6 +6,7 @@ require_relative 'state_manager'
 require_relative 'logger'
 require_relative 'message'
 require_relative 'codec'
+require_relative 'network'
 
 module Swim
   class Protocol
@@ -30,25 +31,20 @@ module Swim
       @members = Concurrent::Map.new
       @callbacks = []
       @running = false
-      @test_mode = false
       @metadata = Concurrent::Map.new
 
       # Add self as a member
       @self_addr = "#{@host}:#{@port}"
       @members[@self_addr] = Member.new(@host, @port)
 
-      @socket = UDPSocket.new
-      @socket.bind(host, port)
-      
-      # Initialize codec
-      @codec = MessagePackCodec.new
+      # Initialize network
+      @network = Network.new(host, port)
+      @network.subscribe(self)
       
       # Initialize metadata
       initial_metadata.each do |key, value|
         set_metadata(key, value)
       end
-
-      initialize_members(seeds)
     end
 
     # Starts the protocol. This method is idempotent, meaning it only starts the
@@ -69,21 +65,10 @@ module Swim
     def start
       return if @running
       @running = true
-
-      @protocol_thread = Thread.new do
-        Logger.info("Starting protocol loop")
-        run_protocol_loop
-      end
-
-      @receive_thread = Thread.new do
-        Logger.info("Starting receive loop")
-        run_receive_loop
-      end
-
-      setup_state_sync
-
-      # Join cluster if we have seeds
-      join_cluster unless @seeds.empty?
+      
+      @network.start
+      setup_periodic_tasks
+      join_cluster
     end
 
     # Stops the SWIM protocol.
@@ -95,19 +80,10 @@ module Swim
       return unless @running
       @running = false
       
-      # 关闭 socket
-      @socket.close rescue nil
-      @sync_thread&.shutdown
-      # 等待线程结束
-      [@protocol_thread, @receive_thread].each do |thread|
-        thread&.join(1) # 等待最多1秒
-        thread&.kill if thread&.alive?
-      end
-      
-      @protocol_thread = nil
-      @receive_thread = nil
-      @sync_thread = nil
-      Logger.info("Stopped SWIM protocol on #{@host}:#{@port}")
+      @network.stop
+      @ping_task&.shutdown
+      @check_task&.shutdown
+      @sync_task&.shutdown
     end
 
     def get_metadata(key, namespace = 'default')
@@ -186,6 +162,49 @@ module Swim
       end
     end
 
+    def on_message_received(message, remote_addr)
+      case message.type
+      when :join
+        handle_join(message.sender)
+      when :ping
+        handle_ping(message.sender)
+      when :ack
+        handle_ack(message.sender)
+      when :ping_req
+        handle_ping_req(message.sender, message.target, message.data)
+      when :ping_ack
+        handle_ping_ack(message.sender, message.target)
+      when :suspect
+        handle_suspect(message.sender, message.target)
+      when :alive
+        handle_alive(message.sender, message.target, message.data[:incarnation])
+      when :dead
+        handle_dead(message.sender, message.target)
+      when :metadata
+        handle_metadata(message.sender, message.data)
+      else
+        Logger.warn("Unknown message type: #{message.type}")
+      end
+    end
+
+    def on_message_sent(message, target_host, target_port, bytes_sent)
+      Logger.debug("Sent #{message.type} to #{target_host}:#{target_port} (#{bytes_sent} bytes)")
+    end
+
+    def on_send_error(error, message, target_host, target_port)
+      Logger.error("Failed to send #{message.type} to #{target_host}:#{target_port}: #{error.message}")
+      handle_member_unreachable("#{target_host}:#{target_port}")
+    end
+
+    def on_receive_error(error)
+      Logger.error("Error in receive loop: #{error.message}")
+      Logger.debug(error.backtrace.join("\n"))
+    end
+
+    def on_decode_error(error, data, sender)
+      Logger.error("Failed to decode message from #{sender[3]}:#{sender[1]}: #{error.message}")
+    end
+
     private
 
     def notify_member_change(addr, old_status, new_status)
@@ -194,33 +213,27 @@ module Swim
       end
     end
 
-    def run_receive_loop
-      while @running
-        begin
-          # 接收消息
-          message, sender = @socket.recvfrom(65535)
-          next unless message && sender
-
-          # 解析消息
-          handle_message(message, sender)
-        rescue => e
-          Logger.error("Error in receive loop: #{e.message}")
-          Logger.debug(e.backtrace.join("\n"))
-        end
+    def setup_periodic_tasks
+      @ping_task = Concurrent::TimerTask.new(execution_interval: PROTOCOL_PERIOD, run_now: true) do
+        ping_random_member
+      end
+      @check_task = Concurrent::TimerTask.new(execution_interval: PROTOCOL_PERIOD, run_now: true) do
+        check_members
+      end
+      @sync_task = Concurrent::TimerTask.new(execution_interval: SYNC_INTERVAL, run_now: true) do
+        setup_state_sync
       end
     end
 
-    def run_protocol_loop
-      while @running
-        begin
-          ping_random_member
-          check_members
-          sleep(1)  # 每秒执行一次
-        rescue => e
-          Logger.error("Error in protocol loop: #{e.message}")
-          Logger.debug(e.backtrace.join("\n"))
-        end
-      end
+    def broadcast_message(message)
+      targets = @members.select { |addr, member| 
+        addr != @self_addr && !member.dead?
+      }.keys
+      @network.broadcast_message(message, targets)
+    end
+
+    def send_message(host, port, message)
+      @network.send_message(message, host, port)
     end
 
     def check_members
@@ -241,83 +254,6 @@ module Swim
             Logger.info("Removed failed member: #{addr}")
           end
         end
-      end
-    end
-
-    def broadcast_message(message)
-      @members.each_pair do |addr, member|
-        next if addr == @self_addr
-        next if member.dead?
-        host, port = addr.split(':')
-        send_message(host, port.to_i, message)
-      end
-    end
-
-    def send_message(host, port, message)
-      begin
-        data = @codec.encode(message)
-        return false unless data
-        
-        bytes_sent = @socket.send(data, 0, host, port)
-        Logger.debug("Sent #{message.type} to #{host}:#{port} (#{bytes_sent} bytes)")
-        true
-      rescue => e
-        Logger.error("Failed to send #{message.type} to #{host}:#{port}: #{e.message}")
-        handle_member_unreachable("#{host}:#{port}")
-        false
-      end
-    end
-
-    def handle_member_unreachable(addr)
-      return unless addr && @members[addr]
-      member = @members[addr]
-      
-      if member.alive?
-        old_status = member.status
-        member.mark_suspect
-        notify_member_change(addr, old_status, :suspect)
-        
-        # Try indirect ping
-        indirect_ping(member)
-      elsif member.suspect?
-        old_status = member.status
-        member.mark_dead
-        notify_member_change(addr, old_status, :dead)
-        @members.delete(addr)
-      end
-    end
-
-    def handle_message(data, remote_addr)
-      begin
-        message = @codec.decode(data)
-        return unless message
-        
-        sender_addr = message.sender
-        
-        case message.type
-        when :join
-          handle_join(sender_addr)
-        when :ping
-          handle_ping(sender_addr)
-        when :ack
-          handle_ack(sender_addr)
-        when :ping_req
-          handle_ping_req(sender_addr, message.target, message.data)
-        when :ping_ack
-          handle_ping_ack(sender_addr, message.target)
-        when :suspect
-          handle_suspect(sender_addr, message.target)
-        when :alive
-          handle_alive(sender_addr, message.target, message.data[:incarnation])
-        when :dead
-          handle_dead(sender_addr, message.target)
-        when :metadata
-          handle_metadata(sender_addr, message.data)
-        else
-          Logger.warn("Unknown message type: #{message.type}")
-        end
-      rescue => e
-        Logger.error("Error handling message from #{remote_addr}: #{e.message}")
       end
     end
 
@@ -378,6 +314,14 @@ module Swim
         old_status = member.status
         member.mark_suspect
         notify_member_change(target_addr, old_status, :suspect)
+        
+        # Try indirect ping
+        indirect_ping(member)
+      elsif member.suspect?
+        old_status = member.status
+        member.mark_dead
+        notify_member_change(target_addr, old_status, :dead)
+        @members.delete(target_addr)
       end
     end
 
@@ -429,24 +373,19 @@ module Swim
     end
 
     def setup_state_sync
-      @sync_thread = Concurrent::TimerTask.new(execution_interval: SYNC_INTERVAL, run_now: true) do
-
-        next if @members.empty?
-        
-        # 随机选择一个活跃的成员进行状态同步
-        alive_addrs = @members.each_pair.select { |_, m| m.alive? }.map(&:first)
-        next if alive_addrs.empty?
-        
-        target_addr = alive_addrs.sample
-        host, port = target_addr.split(':')
-        
-        send_message(host, port.to_i, Message.state_sync(@self_addr, @state_manager.snapshot))
-      rescue => e
-        Logger.error("Error in state sync: #{e.message}")
-        Logger.debug(e.backtrace.join("\n"))
-        # @sync_thread&.shutdown
-      end
-      @sync_thread.execute
+      return if @members.empty?
+      
+      # 随机选择一个活跃的成员进行状态同步
+      alive_addrs = @members.each_pair.select { |_, m| m.alive? }.map(&:first)
+      return if alive_addrs.empty?
+      
+      target_addr = alive_addrs.sample
+      host, port = target_addr.split(':')
+      
+      send_message(host, port.to_i, Message.state_sync(@self_addr, @state_manager.snapshot))
+    rescue => e
+      Logger.error("Error in state sync: #{e.message}")
+      Logger.debug(e.backtrace.join("\n"))
     end
 
     def broadcast_state_update(key, value, operation)

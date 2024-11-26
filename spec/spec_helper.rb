@@ -11,6 +11,9 @@ require 'rspec/wait'
 $LOAD_PATH.unshift File.expand_path('../lib', __dir__)
 require 'swim'
 
+
+Thread.abort_on_exception = true
+# Swim::Logger.level = Logger::DEBUG
 RSpec.configure do |config|
   # Include wait matchers
   config.include RSpec::Wait
@@ -31,8 +34,8 @@ RSpec.configure do |config|
   config.disable_monkey_patching!
   config.warnings = true
 
-  config.order = :random
-  Kernel.srand config.seed
+  # config.order = :random
+  # Kernel.srand config.seed
 
   # Test helpers
   def setup_node(host = 'localhost', port = nil, seeds = [])
