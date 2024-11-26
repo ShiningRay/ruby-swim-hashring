@@ -16,4 +16,5 @@ group :development, :test do
   gem 'timecop', '~> 0.9.6'
   gem 'rspec-wait', '~> 0.0.9'
   gem 'pry'
+  gem 'pry-byebug'
 end

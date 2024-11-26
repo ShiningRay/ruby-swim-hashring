@@ -24,7 +24,7 @@ module Swim
   # @param http_port [Integer, nil] Optional specific port for the HTTP server
   # @return [Swim::Protocol] The protocol instance managing this node
   def self.create_node(host, port, seeds = [], initial_metadata = {}, enable_http: false, http_port: nil)
-    protocol = Protocol.new(host, port, seeds, initial_metadata)
+    protocol = Protocol.new(host, port, seeds)
     
     if enable_http
       http_server = HTTPServer.new(protocol, http_port)

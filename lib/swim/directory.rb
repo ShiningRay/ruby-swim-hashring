@@ -12,6 +12,7 @@ module Swim
     def initialize
       @members = Concurrent::Map.new
       @mutex = Mutex.new
+      @current_node = nil
       Logger.info("Directory initialized")
     end
 
@@ -130,6 +131,60 @@ module Swim
         @members.clear
         old_members.each { |m| broadcast(:member_left, m) }
       end
+    end
+
+    # Set the current node
+    # @param node [Member] the current node
+    def current_node=(node)
+      @mutex.synchronize do
+        @current_node = node
+        Logger.info("Current node set to: #{node.address}")
+      end
+    end
+
+    # Get the current node
+    # @return [Member, nil] the current node or nil if not set
+    def current_node
+      @current_node
+    end
+
+    # Get all peers (members except current node)
+    # @return [Array<Member>] array of all peers
+    def peers
+      return all_members if @current_node.nil?
+      all_members.reject { |m| m.address == @current_node.address }
+    end
+
+    # Get peers by status
+    # @param status [Symbol] the status to filter by (:alive, :suspect, :dead)
+    # @return [Array<Member>] array of peers with the specified status
+    def peers_by_status(status)
+      return members_by_status(status) if @current_node.nil?
+      members_by_status(status).reject { |m| m.address == @current_node.address }
+    end
+
+    # Get alive peers
+    # @return [Array<Member>] array of alive peers
+    def alive_peers
+      peers_by_status(:alive)
+    end
+
+    # Get suspicious peers
+    # @return [Array<Member>] array of suspicious peers
+    def suspicious_peers
+      peers_by_status(:suspect)
+    end
+
+    # Get failed peers
+    # @return [Array<Member>] array of failed peers
+    def failed_peers
+      peers_by_status(:dead)
+    end
+
+    # Get the number of peers
+    # @return [Integer] the number of peers
+    def peers_count
+      peers.size
     end
   end
 end

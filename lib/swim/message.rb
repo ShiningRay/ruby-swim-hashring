@@ -1,4 +1,25 @@
 module Swim
+    # Represents a message in the SWIM protocol.
+    #
+    # The Message class is instantiated with a type, sender and target. The type
+    # must be one of the following:
+    #
+    # * :join
+    # * :ping
+    # * :ack
+    # * :ping_req
+    # * :ping_ack
+    # * :suspect
+    # * :alive
+    # * :dead
+    # * :metadata
+    #
+    # The sender and target are host:port strings. The target may be nil in
+    # cases where the message is not addressed to a specific node.
+    #
+    # The data attribute is a hash of arbitrary data that is associated with the
+    # message. The timestamp attribute is set to the current time when the
+    # message is instantiated.
   class Message
     VALID_TYPES = [:join, :ping, :ack, :ping_req, :ping_ack, :suspect, :alive, :dead, :metadata].freeze
 
@@ -47,10 +68,13 @@ module Swim
       new(:suspect, sender, target)
     end
 
+    # Creates an :alive message, which indicates that a node is alive.
     def self.alive(sender, target, incarnation = nil)
       new(:alive, sender, target, { incarnation: incarnation }.compact)
     end
 
+    # Creates a :dead message, which is sent by a node to indicate that another
+    # node has failed.
     def self.dead(sender, target)
       new(:dead, sender, target)
     end

@@ -1,3 +1,4 @@
+require 'msgpack'
 module Swim
   class Codec
     def encode(message)
@@ -31,20 +32,16 @@ module Swim
     def decode(data)
       return nil if data.nil? || data.empty?
       
-      begin
-        hash = MessagePack.unpack(data)
-        return nil unless hash.is_a?(Hash)
-        
-        Message.new(
-          hash['type'],
-          hash['sender'],
-          hash['target'],
-          symbolize_keys(hash['data'] || {})
-        )
-      rescue => e
-        Logger.error("Failed to decode message: #{e.message}")
-        nil
-      end
+      hash = MessagePack.unpack(data)
+      return nil unless hash.is_a?(Hash)
+      
+      Message.new(
+        hash['type'],
+        hash['sender'],
+        hash['target'],
+        symbolize_keys(hash['data'] || {})
+      )
+ 
     end
   end
 
@@ -57,20 +54,16 @@ module Swim
     def decode(data)
       return nil if data.nil? || data.empty?
       
-      begin
-        hash = JSON.parse(data)
-        return nil unless hash.is_a?(Hash)
-        
-        Message.new(
-          hash['type'],
-          hash['sender'],
-          hash['target'],
-          symbolize_keys(hash['data'] || {})
-        )
-      rescue => e
-        Logger.error("Failed to decode message: #{e.message}")
-        nil
-      end
+      hash = JSON.parse(data)
+      return nil unless hash.is_a?(Hash)
+      
+      Message.new(
+        hash['type'],
+        hash['sender'],
+        hash['target'],
+        symbolize_keys(hash['data'] || {})
+      )
+
     end
   end
 end
